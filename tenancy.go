@@ -3,7 +3,6 @@ package pbtenancy
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
@@ -54,13 +53,21 @@ func Setup(app *pocketbase.PocketBase, options Options) error {
 		return fmt.Errorf("invalid options: %w", err)
 	}
 	
+	// Convert public Options to internal Options
+	internalOpts := tenancy.Options{
+		InviteExpiryDays: options.InviteExpiryDays,
+		AppName:          options.AppName,
+		AppURL:           options.AppURL,
+		LogToConsole:     options.LogToConsole,
+	}
+	
 	// Initialize after app bootstrap
 	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
 		if err := e.Next(); err != nil {
 			return err
 		}
 		
-		return tenancy.Initialize(app, options)
+		return tenancy.Initialize(app, internalOpts)
 	})
 	
 	return nil

@@ -9,6 +9,10 @@ import (
 // createCollections creates all required collections for tenancy.
 // This is idempotent - existing collections are left unchanged.
 //
+// STRATEGY:
+// 1. Create all collections with minimal/no rules first
+// 2. Set proper API rules after all collections and fields exist
+//
 // COLLECTIONS CREATED:
 // - organizations: Multi-tenant organization records
 // - memberships: User-organization relationships with roles
@@ -19,6 +23,7 @@ import (
 //   - nil on successful creation
 //   - error if any collection creation fails
 func createCollections(app *pocketbase.PocketBase) error {
+	// Step 1: Create all collections with fields (no complex rules yet)
 	if err := ensureOrganizationsCollection(app); err != nil {
 		return err
 	}
@@ -35,6 +40,11 @@ func createCollections(app *pocketbase.PocketBase) error {
 		return err
 	}
 	
+	// Step 2: Now that all collections exist, set proper API rules
+	if err := setAPIRules(app); err != nil {
+		return err
+	}
+	
 	return nil
 }
 
@@ -46,13 +56,10 @@ func createCollections(app *pocketbase.PocketBase) error {
 // - owner: Foreign key to users
 // - active: Enable/disable flag
 //
-// API RULES:
-// - List/View: Members can see their organizations
-// - Create: Any authenticated user
-// - Update/Delete: Only organization owner
-//
 // INDEXES:
 // - Unique index on name to prevent duplicates
+//
+// NOTE: API rules are set later in setAPIRules() after all collections exist
 func ensureOrganizationsCollection(app *pocketbase.PocketBase) error {
 	_, err := app.FindCollectionByNameOrId("organizations")
 	if err == nil {
@@ -61,12 +68,7 @@ func ensureOrganizationsCollection(app *pocketbase.PocketBase) error {
 	
 	collection := core.NewBaseCollection("organizations")
 	
-	// API rules - authenticated users can list/view orgs they're members of
-	collection.ListRule = types.Pointer("@collection.memberships.organization.id ?= id && @collection.memberships.user.id ?= @request.auth.id && active = true")
-	collection.ViewRule = types.Pointer("@collection.memberships.organization.id ?= id && @collection.memberships.user.id ?= @request.auth.id && active = true")
-	collection.CreateRule = types.Pointer("@request.auth.id != ''")
-	collection.UpdateRule = types.Pointer("owner = @request.auth.id")
-	collection.DeleteRule = types.Pointer("owner = @request.auth.id")
+	// No rules yet - will be set after all collections exist
 	
 	// Add fields
 	collection.Fields.Add(&core.TextField{
@@ -116,16 +118,12 @@ func ensureOrganizationsCollection(app *pocketbase.PocketBase) error {
 // - role: User role (owner, admin, member)
 // - invited_by: Foreign key to user who sent invite (null for owners)
 //
-// API RULES:
-// - List/View: Users see their own memberships, owners see all in their org
-// - Create: Only organization owners
-// - Update: Only organization owners
-// - Delete: Only owners, but can't delete themselves
-//
 // INDEXES:
 // - Index on user for quick lookups
 // - Index on organization for quick lookups
 // - Compound index for uniqueness checks
+//
+// NOTE: API rules are set later in setAPIRules() after all collections exist
 func ensureMembershipsCollection(app *pocketbase.PocketBase) error {
 	_, err := app.FindCollectionByNameOrId("memberships")
 	if err == nil {
@@ -134,12 +132,7 @@ func ensureMembershipsCollection(app *pocketbase.PocketBase) error {
 	
 	collection := core.NewBaseCollection("memberships")
 	
-	// API rules - users see their own, owners see all in their org
-	collection.ListRule = types.Pointer("user.id = @request.auth.id || organization.owner = @request.auth.id")
-	collection.ViewRule = types.Pointer("user.id = @request.auth.id || organization.owner = @request.auth.id")
-	collection.CreateRule = types.Pointer("organization.owner = @request.auth.id")
-	collection.UpdateRule = types.Pointer("organization.owner = @request.auth.id")
-	collection.DeleteRule = types.Pointer("organization.owner = @request.auth.id && user.id != @request.auth.id")
+	// No rules yet - will be set after all collections exist
 	
 	// Save collection first
 	if err := app.Save(collection); err != nil {
@@ -202,14 +195,13 @@ func ensureMembershipsCollection(app *pocketbase.PocketBase) error {
 // - expires_at: When invite expires
 // - invited_by: Foreign key to user who sent invite
 //
-// API RULES:
-// - List/View/Create/Update/Delete: Only organization owners
-//
 // INDEXES:
 // - Unique index on token for security
 // - Index on email for lookups
 // - Index on organization for filtering
 // - Index on expires_at for cleanup queries
+//
+// NOTE: API rules are set later in setAPIRules() after all collections exist
 func ensureInvitesCollection(app *pocketbase.PocketBase) error {
 	_, err := app.FindCollectionByNameOrId("invites")
 	if err == nil {
@@ -218,12 +210,7 @@ func ensureInvitesCollection(app *pocketbase.PocketBase) error {
 	
 	collection := core.NewBaseCollection("invites")
 	
-	// API rules - only organization owners can manage invites
-	collection.ListRule = types.Pointer("organization.owner = @request.auth.id")
-	collection.ViewRule = types.Pointer("organization.owner = @request.auth.id")
-	collection.CreateRule = types.Pointer("organization.owner = @request.auth.id")
-	collection.UpdateRule = types.Pointer("organization.owner = @request.auth.id")
-	collection.DeleteRule = types.Pointer("organization.owner = @request.auth.id")
+	// No rules yet - will be set after all collections exist
 	
 	// Add basic fields
 	collection.Fields.Add(&core.EmailField{
@@ -243,15 +230,7 @@ func ensureInvitesCollection(app *pocketbase.PocketBase) error {
 		Name: "resend_invite",
 	})
 	
-	// Add indexes
-	collection.Indexes = []string{
-		"CREATE UNIQUE INDEX idx_token ON invites (token)",
-		"CREATE INDEX idx_invites_email ON invites (email)",
-		"CREATE INDEX idx_invites_org ON invites (organization)",
-		"CREATE INDEX idx_invites_expires ON invites (expires_at)",
-	}
-	
-	// Save collection first
+	// Save collection first (with basic fields only)
 	if err := app.Save(collection); err != nil {
 		return err
 	}
@@ -287,14 +266,24 @@ func ensureInvitesCollection(app *pocketbase.PocketBase) error {
 		CollectionId: usersCollection.Id,
 	})
 	
+	// Now add indexes AFTER all fields exist
+	collection.Indexes = []string{
+		"CREATE UNIQUE INDEX idx_token ON invites (token)",
+		"CREATE INDEX idx_invites_email ON invites (email)",
+		"CREATE INDEX idx_invites_org ON invites (organization)",
+		"CREATE INDEX idx_invites_expires ON invites (expires_at)",
+	}
+	
+	// Final save with all fields and indexes
 	return app.Save(collection)
 }
 
 // addCurrentOrgFieldToUsers adds current_organization field to users collection.
-// This field tracks which organization the user is currently working in.
 //
 // FIELD SCHEMA:
 // - current_organization: Optional relation to organizations
+//
+// NOTE: Update rule with membership validation is set later in setAPIRules()
 //
 // USAGE:
 // Users can switch between organizations they're members of by updating this field.
@@ -320,5 +309,103 @@ func addCurrentOrgFieldToUsers(app *pocketbase.PocketBase) error {
 		CollectionId: orgsCollection.Id,
 	})
 	
+	// No rule yet - will be set after all collections exist
+	
 	return app.Save(usersCollection)
+}
+
+// setAPIRules sets API rules for all collections after they've been created.
+// This must be called after all collections and fields exist to avoid
+// reference errors.
+//
+// RULES SET:
+// - organizations: Member-based access control
+// - memberships: Self and owner access
+// - invites: Owner-only access
+// - users: Self-update with membership validation
+//
+// RETURNS:
+//   - nil on success
+//   - error if rule setting fails
+func setAPIRules(app *pocketbase.PocketBase) error {
+	// Set organizations rules
+	orgsCollection, err := app.FindCollectionByNameOrId("organizations")
+	if err != nil {
+		return err
+	}
+	
+	// Users can only see organizations they're members of
+	// Simplified from original to avoid complexity
+	orgsCollection.ListRule = types.Pointer(
+		"@request.auth.id != '' && " +
+		"(@collection.memberships.user.id ?= @request.auth.id && " +
+		"@collection.memberships.organization.id ?= id)",
+	)
+	orgsCollection.ViewRule = types.Pointer(
+		"@request.auth.id != '' && " +
+		"(@collection.memberships.user.id ?= @request.auth.id && " +
+		"@collection.memberships.organization.id ?= id)",
+	)
+	orgsCollection.CreateRule = types.Pointer("@request.auth.id != ''")
+	orgsCollection.UpdateRule = types.Pointer("owner = @request.auth.id")
+	orgsCollection.DeleteRule = types.Pointer("owner = @request.auth.id")
+	
+	if err := app.Save(orgsCollection); err != nil {
+		return err
+	}
+	
+	// Set memberships rules
+	membershipsCollection, err := app.FindCollectionByNameOrId("memberships")
+	if err != nil {
+		return err
+	}
+	
+	// Users can see their own memberships, owners can manage their org's memberships
+	membershipsCollection.ListRule = types.Pointer("user.id = @request.auth.id || organization.owner = @request.auth.id")
+	membershipsCollection.ViewRule = types.Pointer("user.id = @request.auth.id || organization.owner = @request.auth.id")
+	membershipsCollection.CreateRule = types.Pointer("organization.owner = @request.auth.id")
+	membershipsCollection.UpdateRule = types.Pointer("organization.owner = @request.auth.id")
+	membershipsCollection.DeleteRule = types.Pointer("organization.owner = @request.auth.id && user.id != @request.auth.id")
+	
+	if err := app.Save(membershipsCollection); err != nil {
+		return err
+	}
+	
+	// Set invites rules
+	invitesCollection, err := app.FindCollectionByNameOrId("invites")
+	if err != nil {
+		return err
+	}
+	
+	// Only organization owners can manage invites
+	invitesCollection.ListRule = types.Pointer("organization.owner = @request.auth.id")
+	invitesCollection.ViewRule = types.Pointer("organization.owner = @request.auth.id")
+	invitesCollection.CreateRule = types.Pointer("organization.owner = @request.auth.id")
+	invitesCollection.UpdateRule = types.Pointer("organization.owner = @request.auth.id")
+	invitesCollection.DeleteRule = types.Pointer("organization.owner = @request.auth.id")
+	
+	if err := app.Save(invitesCollection); err != nil {
+		return err
+	}
+	
+	// Set users rules
+	usersCollection, err := app.FindCollectionByNameOrId("users")
+	if err != nil {
+		return err
+	}
+	
+	// Users can update themselves, with validation for current_organization
+	usersCollection.UpdateRule = types.Pointer(
+		"@request.auth.id = id && " +
+		"(@request.body.current_organization = '' || " +
+		"@request.body.current_organization = null || " +
+		"(@collection.memberships.user.id ?= @request.auth.id && " +
+		"@collection.memberships.organization.id ?= @request.body.current_organization))",
+	)
+	
+	if err := app.Save(usersCollection); err != nil {
+		return err
+	}
+	
+	return nil
 }
