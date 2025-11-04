@@ -1,7 +1,6 @@
 package tenancy
 
 import (
-	"fmt"
 	"net/http"
 	"time"
 

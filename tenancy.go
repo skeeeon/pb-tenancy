@@ -7,7 +7,7 @@ import (
 
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
-	"internal/tenancy"
+	"github.com/skeeeon/pb-tenancy/internal/tenancy"
 )
 
 // Options configures the behavior of multi-tenancy.

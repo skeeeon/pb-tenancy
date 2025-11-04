@@ -83,7 +83,7 @@ func ensureOrganizationsCollection(app *pocketbase.PocketBase) error {
 	})
 	
 	// Add unique index on name
-	collection.Indexes = types.JsonArray[string]{
+	collection.Indexes = []string{
 		"CREATE UNIQUE INDEX idx_unique_org_name ON organizations (name)",
 	}
 	
@@ -183,7 +183,7 @@ func ensureMembershipsCollection(app *pocketbase.PocketBase) error {
 	})
 	
 	// Add indexes for performance
-	collection.Indexes = types.JsonArray[string]{
+	collection.Indexes = []string{
 		"CREATE INDEX idx_memberships_user ON memberships (user)",
 		"CREATE INDEX idx_memberships_org ON memberships (organization)",
 		"CREATE INDEX idx_memberships_user_org ON memberships (user, organization)",
@@ -244,7 +244,7 @@ func ensureInvitesCollection(app *pocketbase.PocketBase) error {
 	})
 	
 	// Add indexes
-	collection.Indexes = types.JsonArray[string]{
+	collection.Indexes = []string{
 		"CREATE UNIQUE INDEX idx_token ON invites (token)",
 		"CREATE INDEX idx_invites_email ON invites (email)",
 		"CREATE INDEX idx_invites_org ON invites (organization)",

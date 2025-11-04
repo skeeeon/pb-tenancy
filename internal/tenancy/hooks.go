@@ -53,23 +53,19 @@ func registerHooks(app *pocketbase.PocketBase, options Options) error {
 	
 	// Hook 4: Invite updated with resend_invite → send email again
 	app.OnRecordUpdateRequest("invites").BindFunc(func(e *core.RecordRequestEvent) error {
+		// Check if resend_invite flag is being set to true
 		if e.Record.GetBool("resend_invite") {
-			// Clear flag to prevent loops
-			e.Record.Set("resend_invite", false)
-		}
-		return e.Next()
-	})
-	
-	app.OnRecordAfterUpdateSuccess("invites").BindFunc(func(e *core.RecordEvent) error {
-		// Check if this was a resend request (flag was true before clearing)
-		if e.Record.OriginalCopy().GetBool("resend_invite") {
+			// Send email immediately (before clearing flag)
 			if err := sendInviteEmail(app, e.Record, options); err != nil {
 				if options.LogToConsole {
 					fmt.Printf("⚠️  WARNING Failed to resend invite email: %v\n", err)
 				}
 			}
+			
+			// Clear flag to prevent loops
+			e.Record.Set("resend_invite", false)
 		}
-		return nil
+		return e.Next()
 	})
 	
 	return nil
