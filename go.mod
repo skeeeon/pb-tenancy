@@ -1,4 +1,4 @@
-module pb-tenancy
+module github.com/skeeeon/pb-tenancy
 
 go 1.24.0
 
