@@ -5,21 +5,22 @@ A minimal library that adds multi-organization tenancy to [PocketBase](https://p
 ## Features
 
 - ✅ **User belongs to multiple organizations** with roles (owner/admin/member)
-- ✅ **Invitation system** with email via PocketBase mailer
+- ✅ **Secure invitation system** with email via PocketBase mailer
 - ✅ **Organization context** (`current_organization` field tracks active org)
 - ✅ **Automatic owner membership** on organization creation
-- ✅ **Secure invite tokens** with expiration
-- ✅ **Simple, explicit behavior** - easy to understand and debug
-- ✅ **Self-contained** - bootstraps its own collections and hooks
+- ✅ **Non-destructive setup** - Preserves your custom API rule changes after initial setup
+- ✅ **Configurable collection names** - Avoid conflicts with your existing schema
+- ✅ **Simple, explicit behavior** - Easy to understand and debug
+- ✅ **Self-contained** - Bootstraps its own collections and hooks
 
 ## Philosophy
 
 - **One entry point** - `Setup()` does everything
 - **Uses PocketBase built-ins** (email, hooks, collections, API rules)
-- **Minimal abstraction** - clear functions that do one thing
-- **Self-contained** - bootstraps its own collections and hooks
-- **No background cleanup** - developers handle when needed
-- **No helper functions** - developers know their patterns
+- **Minimal abstraction** - Clear functions that do one thing
+- **Self-contained** - Bootstraps its own collections and hooks
+- **Preserves customizations** - Won't overwrite your API rules after the initial setup
+- **No background cleanup** - Developers handle when needed
 
 ## Installation
 
@@ -46,15 +47,17 @@ func main() {
         log.Fatal(err)
     }
     
-    app.Start()
+    if err := app.Start(); err != nil {
+        log.Fatal(err)
+    }
 }
 ```
 
 ## Data Model
 
-### Collections Schema
+The library creates the following collections. You can customize the names via the `Options`.
 
-#### `organizations`
+#### `organizations` (default name)
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | text (unique) | Organization name |
@@ -67,10 +70,10 @@ func main() {
 - Create: Any authenticated user
 - Update/Delete: Only organization owner
 
-#### `memberships`
+#### `memberships` (default name)
 | Field | Type | Description |
 |-------|------|-------------|
-| `user` | relation → users | Member user |
+| `user` | relation → users | Member user (unique with organization) |
 | `organization` | relation → organizations | Organization |
 | `role` | select | owner, admin, member |
 | `invited_by` | relation → users | Who sent invite (null for owners) |
@@ -78,9 +81,9 @@ func main() {
 **API Rules:**
 - List/View: Users see their own, owners see all in their org
 - Create/Update: Only organization owners
-- Delete: Only owners, but can't delete themselves
+- Delete: Owners can remove others (but not themselves); members can remove themselves to leave.
 
-#### `invites`
+#### `invites` (default name)
 | Field | Type | Description |
 |-------|------|-------------|
 | `email` | email | Invitee email |
@@ -114,6 +117,11 @@ options.AppName = "My IoT Platform"
 // Custom app URL for invite links (default: from PocketBase settings)
 options.AppURL = "https://myapp.com"
 
+// Customize collection names to avoid conflicts
+options.OrganizationsCollection = "companies"
+options.MembershipsCollection = "company_members"
+options.InvitesCollection = "company_invites"
+
 // Disable console logging (default: true)
 options.LogToConsole = false
 
@@ -143,10 +151,8 @@ await pb.collection('invites').create({
     role: 'member'
 })
 // Hook automatically:
-// - Generates secure token
-// - Sets expiry date
-// - Sets invited_by to current user
-// - Sends email!
+// - Generates secure token, sets expiry date, and sets invited_by
+// - Sends an email to the user!
 ```
 
 ### Resending an Invitation
@@ -158,98 +164,62 @@ await pb.collection('invites').update(inviteId, {
 // Email sent again with same token/expiry
 ```
 
-### Accepting an Invitation (New User)
+### Accepting an Invitation
+
+Accepting an invitation is a secure, two-step process. The user **must be authenticated** to accept.
+
+**Onboarding Flow:**
+1.  A user receives an invite email and clicks the link.
+2.  Your application directs them to a page (e.g., `/accept-invite?token=...`).
+3.  If the user is not logged in, your UI should prompt them to **log in or sign up**. If they are a new user, they must create an account with the same email address the invitation was sent to.
+4.  Once authenticated, your application can make the API call to accept the invite.
 
 ```javascript
+// 1. User must be authenticated first
+await pb.collection('users').authWithPassword('user@example.com', 'password');
+
+// 2. Make the API call with the token
 await fetch('/api/tenancy/accept-invite', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-        token: tokenFromURL,
-        password: 'secure-password',
-        passwordConfirm: 'secure-password'
-    })
-})
-// Creates user account, adds to organization, deletes invite
-```
-
-### Accepting an Invitation (Existing User)
-
-```javascript
-// User must be authenticated first
-await pb.collection('users').authWithPassword('user@example.com', 'password')
-
-await fetch('/api/tenancy/accept-invite', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+        'Content-Type': 'application/json',
+        'Authorization': pb.authStore.token // Pass the auth token
+    },
     body: JSON.stringify({
         token: tokenFromURL
     })
-})
-// Adds user to organization, deletes invite
+});
+// On success, the user is added to the organization and the invite is deleted.
 ```
 
 ### Switching Organizations
 
 ```javascript
-// Just update the field!
+// Just update the user's current_organization field!
 await pb.collection('users').update(pb.authStore.model.id, {
     current_organization: newOrgId
 })
 ```
 
-### Listing User's Organizations
+### Listing a User's Organizations
 
 ```javascript
 const memberships = await pb.collection('memberships').getFullList({
     filter: `user = "${pb.authStore.model.id}"`,
     expand: 'organization'
-})
+});
 
 memberships.forEach(membership => {
-    console.log(membership.expand.organization.name, membership.role)
-})
+    console.log(membership.expand.organization.name, membership.role);
+});
 ```
 
 ### Leaving an Organization
 
 ```javascript
-// Just delete the membership (API rules prevent deleting yourself if you're owner)
-await pb.collection('memberships').delete(membershipId)
-```
-
-## Integration with Other Libraries
-
-### With pb-nats (NATS JWT Authentication)
-
-```go
-func main() {
-    app := pocketbase.New()
-    
-    // Setup tenancy first
-    pbtenancy.Setup(app, pbtenancy.DefaultOptions())
-    
-    // Setup NATS integration
-    pbnats.Setup(app, pbnats.DefaultOptions())
-    
-    app.Start()
-}
-```
-
-### With pb-audit (Audit Logging)
-
-```go
-func main() {
-    app := pocketbase.New()
-    
-    // Setup tenancy
-    pbtenancy.Setup(app, pbtenancy.DefaultOptions())
-    
-    // Setup audit logging (logs all tenancy operations)
-    pbaudit.Setup(app, pbaudit.DefaultOptions())
-    
-    app.Start()
-}
+// Members can delete their own membership record to leave.
+// Owners can remove other members, but cannot remove themselves.
+await pb.collection('memberships').delete(membershipId);
 ```
 
 ## What Developers Need to Handle
@@ -260,186 +230,67 @@ We don't do everything for you:
 
 ```javascript
 // Run this periodically (cron job, etc.)
-const now = new Date().toISOString()
+const now = new Date().toISOString();
 const expired = await pb.collection('invites').getFullList({
     filter: `expires_at < "${now}"`
-})
+});
 
 for (const invite of expired) {
-    await pb.collection('invites').delete(invite.id)
+    await pb.collection('invites').delete(invite.id);
 }
 ```
 
-### 2. Custom Notification Channels
+### 2. Organization-Scoped Queries
+
+You are responsible for scoping your own collection queries to the user's active organization.
 
 ```javascript
-// After creating invite, send via your preferred channel
-const invite = await pb.collection('invites').create({...})
-
-if (userType === 'technician') {
-    await sendSMS(user.phone, inviteLink)
-} else {
-    await sendSlack(user.slackId, inviteLink)
-}
-```
-
-### 3. Organization-Scoped Queries
-
-```javascript
-// Query data for current organization
+// Query data for the current organization
 const devices = await pb.collection('devices').getFullList({
     filter: `organization = "${pb.authStore.model.current_organization}"`
-})
+});
 ```
 
-### 4. Advanced Member Visibility
+### 3. Advanced Member Visibility
 
-If you want members to see other members in their organization, update the API rules:
+If you want members to see other members in their organization, update the API rules for the `memberships` collection:
 
-```javascript
+```
 // In memberships collection API rules:
 // list: "user.id = @request.auth.id || 
 //        organization.owner = @request.auth.id || 
 //        organization.id = @request.auth.current_organization"
 ```
 
-## API Rules Customization
-
-The library sets up sensible defaults, but you can customize:
-
-### Example: Role-Based Visibility
-
-```javascript
-// memberships collection
-list: "user.id = @request.auth.id || 
-       organization.owner = @request.auth.id ||
-       (organization.id = @request.auth.current_organization && 
-        @collection.memberships.role ?= 'admin')"
-```
-
-### Example: Organization-Scoped Collections
-
-When creating your own collections:
-
-```javascript
-// Add organization field
-collection.Fields.Add(&core.RelationField{
-    Name:         "organization",
-    Required:     true,
-    CollectionId: organizationsCollection.Id,
-})
-
-// Scope list rule to current organization
-collection.ListRule = types.Pointer(
-    "organization = @request.auth.current_organization"
-)
-```
-
 ## Testing Checklist
 
 - ✅ Organization creation auto-creates owner membership
 - ✅ Invite creation generates token and sends email
-- ✅ Accept invite creates user + membership (new user)
-- ✅ Accept invite adds membership (existing user)
-- ✅ Expired invites rejected with 410 Gone
-- ✅ Already-member handles gracefully
+- ✅ Accept invite adds membership for authenticated user
+- ✅ Expired invites are rejected with 410 Gone
+- ✅ Accepting an invite for an organization you're already in handles gracefully
 - ✅ Owner cannot delete own membership (API rule)
+- ✅ Member can leave organization by deleting their membership (API rule)
 - ✅ Only owners can manage invites (API rule)
-- ✅ Unique organization names enforced
+- ✅ Unique organization names are enforced
 - ✅ Resend invite works without modifying token/expiry
-
-## IoT Platform Integration Example
-
-```go
-func main() {
-    app := pocketbase.New()
-    
-    // Setup tenancy
-    pbtenancy.Setup(app, pbtenancy.DefaultOptions())
-    
-    // Setup NATS
-    pbnats.Setup(app, pbnats.DefaultOptions())
-    
-    // Create IoT collections with organization scoping
-    app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
-        createEdgesCollection(app)
-        createThingsCollection(app)
-        return e.Next()
-    })
-    
-    app.Start()
-}
-
-func createEdgesCollection(app *pocketbase.PocketBase) {
-    collection := core.NewBaseCollection("edges")
-    
-    // Organization scoping
-    orgsCollection, _ := app.FindCollectionByNameOrId("organizations")
-    collection.Fields.Add(&core.RelationField{
-        Name:         "organization",
-        Required:     true,
-        CollectionId: orgsCollection.Id,
-    })
-    
-    // API rules - org scoped
-    collection.ListRule = types.Pointer(
-        "organization = @request.auth.current_organization"
-    )
-    collection.CreateRule = types.Pointer(
-        "@request.auth.id != '' && organization = @request.auth.current_organization"
-    )
-    
-    // Other fields...
-    
-    app.Save(collection)
-}
-```
 
 ## Troubleshooting
 
 ### Emails Not Sending
 
-Check PocketBase email settings:
-```bash
-# Admin UI → Settings → Mail settings
-# Or via environment variables
-```
-
-Email failures are logged but don't block invite creation.
+Check PocketBase email settings in the Admin UI → Settings → Mail settings, or via environment variables. Email failures are logged but do not block invite creation.
 
 ### Invite Token Not Working
 
-- Check if token expired (`expires_at < now`)
-- Check if token is correct (case-sensitive, URL-encoded)
-- Check if invite was already accepted (deleted after acceptance)
-
-### User Can't See Organization
-
-Check:
-- User has membership in that organization
-- Organization is active (`active = true`)
-- Membership query includes proper filter
-
-### Organization Name Already Exists
-
-Organization names must be unique. Either:
-- Choose different name
-- Delete existing organization with that name
-- Update existing organization instead
+- Check if the user is authenticated before trying to accept.
+- Check if the token has expired (`expires_at < now`).
+- Check if the invite was already accepted (it is deleted after acceptance).
 
 ## Contributing
 
-Contributions welcome! 
-- Simple, explicit code
-- Clear function purposes
-- Minimal abstractions
-- Easy to debug
+Contributions welcome! Please adhere to the project's philosophy of simple, explicit, and debuggable code.
 
 ## License
 
-MIT License - see LICENSE file for details.
-
-## Related Libraries
-
-- [pb-nats](https://github.com/skeeeon/pb-nats) - NATS JWT authentication
-- [pb-audit](https://github.com/skeeeon/pb-audit) - Audit logging
+MIT License.

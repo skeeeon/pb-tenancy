@@ -30,44 +30,39 @@ import (
 //   - nil on successful hook registration
 //   - error if registration fails
 func registerHooks(app *pocketbase.PocketBase, options Options) error {
-	// Hook 1: Organization created → auto-create owner membership
-	app.OnRecordAfterCreateSuccess("organizations").BindFunc(func(e *core.RecordEvent) error {
-		return autoCreateOwnerMembership(app, e.Record)
+	// Hook 1: Organization created -> auto-create owner membership
+	app.OnRecordAfterCreateSuccess(options.OrganizationsCollection).BindFunc(func(e *core.RecordEvent) error {
+		return autoCreateOwnerMembership(app, e.Record, options)
 	})
-	
-	// Hook 2: Invite created → auto-set token and expiry
-	app.OnRecordCreateRequest("invites").BindFunc(func(e *core.RecordRequestEvent) error {
+
+	// Hook 2: Invite created -> auto-set token and expiry
+	app.OnRecordCreateRequest(options.InvitesCollection).BindFunc(func(e *core.RecordRequestEvent) error {
 		return autoSetInviteFields(app, e.Record, e, options)
 	})
-	
-	// Hook 3: Invite created → send email
-	app.OnRecordAfterCreateSuccess("invites").BindFunc(func(e *core.RecordEvent) error {
+
+	// Hook 3: Invite created -> send email
+	app.OnRecordAfterCreateSuccess(options.InvitesCollection).BindFunc(func(e *core.RecordEvent) error {
 		if err := sendInviteEmail(app, e.Record, options); err != nil {
-			// Log error but don't fail - email issues shouldn't block invite creation
 			if options.LogToConsole {
 				fmt.Printf("⚠️  WARNING Failed to send invite email: %v\n", err)
 			}
 		}
 		return nil
 	})
-	
-	// Hook 4: Invite updated with resend_invite → send email again
-	app.OnRecordUpdateRequest("invites").BindFunc(func(e *core.RecordRequestEvent) error {
-		// Check if resend_invite flag is being set to true
+
+	// Hook 4: Invite updated with resend_invite -> send email again
+	app.OnRecordUpdateRequest(options.InvitesCollection).BindFunc(func(e *core.RecordRequestEvent) error {
 		if e.Record.GetBool("resend_invite") {
-			// Send email immediately (before clearing flag)
 			if err := sendInviteEmail(app, e.Record, options); err != nil {
 				if options.LogToConsole {
 					fmt.Printf("⚠️  WARNING Failed to resend invite email: %v\n", err)
 				}
 			}
-			
-			// Clear flag to prevent loops
 			e.Record.Set("resend_invite", false)
 		}
 		return e.Next()
 	})
-	
+
 	return nil
 }
 
@@ -85,30 +80,27 @@ func registerHooks(app *pocketbase.PocketBase, options Options) error {
 // RETURNS:
 //   - nil on successful membership creation
 //   - error if membership creation fails
-func autoCreateOwnerMembership(app *pocketbase.PocketBase, orgRecord *core.Record) error {
+func autoCreateOwnerMembership(app *pocketbase.PocketBase, orgRecord *core.Record, options Options) error {
 	ownerID := orgRecord.GetString("owner")
-	
-	collection, err := app.FindCollectionByNameOrId("memberships")
+	collection, err := app.FindCollectionByNameOrId(options.MembershipsCollection)
 	if err != nil {
 		return err
 	}
-	
+
 	membership := core.NewRecord(collection)
 	membership.Set("user", ownerID)
 	membership.Set("organization", orgRecord.Id)
 	membership.Set("role", "owner")
-	
+
 	if err := app.Save(membership); err != nil {
 		return err
 	}
-	
-	// Set as current organization for the owner
+
 	userRecord, err := app.FindRecordById("users", ownerID)
 	if err == nil {
 		userRecord.Set("current_organization", orgRecord.Id)
 		app.Save(userRecord)
 	}
-	
 	return nil
 }
 
@@ -129,25 +121,21 @@ func autoCreateOwnerMembership(app *pocketbase.PocketBase, orgRecord *core.Recor
 //   - nil on successful field setting
 //   - error if token generation fails
 func autoSetInviteFields(app *pocketbase.PocketBase, record *core.Record, e *core.RecordRequestEvent, options Options) error {
-	// Generate secure token
 	token, err := generateSecureToken()
 	if err != nil {
 		return err
 	}
 	record.Set("token", token)
-	
-	// Set expiration
+
 	expiresAt := time.Now().AddDate(0, 0, options.InviteExpiryDays)
 	record.Set("expires_at", expiresAt)
-	
-	// Set invited_by to current authenticated user
+
 	if e.Request != nil {
 		info, err := e.RequestInfo()
 		if err == nil && info.Auth != nil {
 			record.Set("invited_by", info.Auth.Id)
 		}
 	}
-	
 	return nil
 }
 
