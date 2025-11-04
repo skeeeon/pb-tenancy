@@ -51,6 +51,9 @@ func ensureOrganizationsCollection(app *pocketbase.PocketBase, options Options) 
 	if err != nil {
 		return err
 	}
+	// IMPORTANT: CascadeDelete is intentionally false here.
+	// Deleting a user should not delete the entire organization.
+	// PocketBase will prevent user deletion if they are an owner, which is safer.
 	collection.Fields.Add(&core.RelationField{
 		Name: "owner", Required: true, MaxSelect: 1, CollectionId: usersCollection.Id,
 	})
@@ -73,8 +76,22 @@ func ensureMembershipsCollection(app *pocketbase.PocketBase, options Options) er
 	usersCollection, _ := app.FindCollectionByNameOrId("users")
 	orgsCollection, _ := app.FindCollectionByNameOrId(options.OrganizationsCollection)
 
-	collection.Fields.Add(&core.RelationField{Name: "user", Required: true, MaxSelect: 1, CollectionId: usersCollection.Id})
-	collection.Fields.Add(&core.RelationField{Name: "organization", Required: true, MaxSelect: 1, CollectionId: orgsCollection.Id})
+	// If a user is deleted, their membership is removed.
+	collection.Fields.Add(&core.RelationField{
+		Name:         "user",
+		Required:     true,
+		MaxSelect:    1,
+		CascadeDelete: true,
+		CollectionId: usersCollection.Id,
+	})
+	// If an organization is deleted, all its memberships are removed.
+	collection.Fields.Add(&core.RelationField{
+		Name:         "organization",
+		Required:     true,
+		MaxSelect:    1,
+		CascadeDelete: true,
+		CollectionId: orgsCollection.Id,
+	})
 	collection.Fields.Add(&core.SelectField{Name: "role", Required: true, MaxSelect: 1, Values: []string{"owner", "admin", "member"}})
 	collection.Fields.Add(&core.RelationField{Name: "invited_by", MaxSelect: 1, CollectionId: usersCollection.Id})
 	collection.Indexes = []string{
@@ -106,9 +123,23 @@ func ensureInvitesCollection(app *pocketbase.PocketBase, options Options) error 
 	usersCollection, _ := app.FindCollectionByNameOrId("users")
 	orgsCollection, _ := app.FindCollectionByNameOrId(options.OrganizationsCollection)
 
-	collection.Fields.Add(&core.RelationField{Name: "organization", Required: true, MaxSelect: 1, CollectionId: orgsCollection.Id})
+	// If an organization is deleted, all its pending invites are removed.
+	collection.Fields.Add(&core.RelationField{
+		Name:         "organization",
+		Required:     true,
+		MaxSelect:    1,
+		CascadeDelete: true,
+		CollectionId: orgsCollection.Id,
+	})
 	collection.Fields.Add(&core.SelectField{Name: "role", Required: true, MaxSelect: 1, Values: []string{"admin", "member"}})
-	collection.Fields.Add(&core.RelationField{Name: "invited_by", Required: true, MaxSelect: 1, CollectionId: usersCollection.Id})
+	// If the user who sent the invite is deleted, the invite is removed.
+	collection.Fields.Add(&core.RelationField{
+		Name:         "invited_by",
+		Required:     true,
+		MaxSelect:    1,
+		CascadeDelete: true,
+		CollectionId: usersCollection.Id,
+	})
 	collection.Indexes = []string{
 		fmt.Sprintf("CREATE UNIQUE INDEX idx_token ON %s (token)", name),
 		fmt.Sprintf("CREATE INDEX idx_invites_email ON %s (email)", name),
@@ -131,6 +162,9 @@ func addCurrentOrgFieldToUsers(app *pocketbase.PocketBase, options Options) erro
 	if err != nil {
 		return err
 	}
+
+	// When an organization is deleted, this field on the user record
+	// will be automatically cleared by PocketBase.
 	usersCollection.Fields.Add(&core.RelationField{
 		Name: "current_organization", MaxSelect: 1, CollectionId: orgsCollection.Id,
 	})
