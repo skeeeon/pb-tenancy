@@ -14,7 +14,6 @@ import (
 
 func registerInviteEndpoint(app *pocketbase.PocketBase, options Options) error {
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
-		// UPDATED: The handler is now a closure to capture the options
 		se.Router.POST("/api/tenancy/accept-invite", func(e *core.RequestEvent) error {
 			return acceptInviteHandler(e, app, options)
 		}).Bind(apis.RequireAuth())
@@ -36,54 +35,82 @@ func acceptInviteHandler(e *core.RequestEvent, app *pocketbase.PocketBase, optio
 		return e.BadRequestError("Token is required", nil)
 	}
 
+	// Find the invite record
 	invite, err := app.FindFirstRecordByFilter(options.InvitesCollection, "token = {:token}",
 		dbx.Params{"token": data.Token})
 	if err != nil {
-		return e.NotFoundError("Invalid or expired invitation", nil)
+		return e.NotFoundError("Invalid or expired invitation", err)
 	}
 
+	// --- Pre-transaction checks and early exits ---
+
+	// Check if expired
 	if time.Now().After(invite.GetDateTime("expires_at").Time()) {
-		app.Delete(invite)
+		app.Delete(invite) // Cleanup expired invite
 		return e.Error(http.StatusGone, "This invitation has expired", nil)
 	}
 
+	// Check if the invite is for the authenticated user
 	if authRecord.Email() != invite.GetString("email") {
 		return e.ForbiddenError("This invitation is for a different user.", nil)
 	}
 
 	orgID := invite.GetString("organization")
+
+	// Check if user is already a member
 	existingMembership, _ := app.FindFirstRecordByFilter(options.MembershipsCollection,
 		"user = {:user} && organization = {:org}",
 		dbx.Params{"user": authRecord.Id, "org": orgID})
 
 	if existingMembership != nil {
-		app.Delete(invite)
+		app.Delete(invite) // Cleanup the now-redundant invite
 		return e.JSON(http.StatusOK, map[string]interface{}{
-			"success": true, "alreadyMember": true, "message": "You are already a member of this organization",
+			"message":       "You are already a member of this organization.",
+			"alreadyMember": true,
 		})
 	}
 
-	if err := createMembership(app, authRecord.Id, orgID, invite.GetString("role"), invite.GetString("invited_by"), options); err != nil {
-		return e.InternalServerError("Failed to add membership", err)
-	}
-
-	if authRecord.GetString("current_organization") == "" {
-		authRecord.Set("current_organization", orgID)
-		if err := app.Save(authRecord); err != nil {
-			app.Logger().Error("Failed to set current_organization after invite accept", "error", err)
+	// --- Transactional block for creating membership and cleaning up ---
+	// Use app.RunInTransaction to ensure atomicity.
+	err = app.RunInTransaction(func(txApp core.App) error {
+		// 1. Create the membership record
+		if err := createMembership(txApp, authRecord.Id, orgID, invite.GetString("role"), invite.GetString("invited_by"), options); err != nil {
+			return err
 		}
-	}
 
-	if err := app.Delete(invite); err != nil {
-		app.Logger().Error("Failed to delete invite after acceptance", "error", err)
+		// 2. If user has no active org, set this one as current
+		// It's safer to fetch the record again inside the transaction.
+		userToUpdate, err := txApp.FindRecordById("users", authRecord.Id)
+		if err != nil {
+			return err
+		}
+		if userToUpdate.GetString("current_organization") == "" {
+			userToUpdate.Set("current_organization", orgID)
+			if err := txApp.Save(userToUpdate); err != nil {
+				return err
+			}
+		}
+
+		// 3. Delete the invite record
+		if err := txApp.Delete(invite); err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return e.InternalServerError("Failed to accept invitation", err)
 	}
 
 	return e.JSON(http.StatusOK, map[string]interface{}{
-		"success": true, "message": "Successfully joined organization",
+		"message": "Successfully joined organization.",
 	})
 }
 
-func createMembership(app *pocketbase.PocketBase, userID, orgID, role, invitedBy string, options Options) error {
+// createMembership creates a new membership record using a core.App instance,
+// making it compatible with transactions.
+func createMembership(app core.App, userID, orgID, role, invitedBy string, options Options) error {
 	collection, err := app.FindCollectionByNameOrId(options.MembershipsCollection)
 	if err != nil {
 		return err
