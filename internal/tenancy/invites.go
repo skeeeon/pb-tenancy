@@ -6,6 +6,7 @@ import (
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase"
+	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -15,10 +16,10 @@ import (
 // POST /api/tenancy/accept-invite
 //
 // BEHAVIOR:
-// - Validates invite token and expiry
-// - Creates new user account if email doesn't exist
-// - Adds user to organization as member
-// - Deletes invite after successful acceptance
+// - Requires an authenticated user session.
+// - Validates invite token, expiry, and ensures the invite is for the authenticated user.
+// - Adds the user to the organization as a member.
+// - Deletes the invite after successful acceptance.
 //
 // RATE LIMITING:
 // Automatically applied via PocketBase's built-in rate limiter
@@ -32,27 +33,28 @@ import (
 //   - error if endpoint registration fails
 func registerInviteEndpoint(app *pocketbase.PocketBase, options Options) error {
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
+		// CORRECTED: The middleware is chained with .Bind()
 		se.Router.POST("/api/tenancy/accept-invite", func(e *core.RequestEvent) error {
 			return acceptInviteHandler(e, app)
-		})
+		}).Bind(apis.RequireAuth())
+
 		return se.Next()
 	})
 	return nil
 }
 
-// acceptInviteHandler handles the accept-invite endpoint.
+// acceptInviteHandler handles the accept-invite endpoint for authenticated users.
 //
 // REQUEST BODY:
 // - token: Invite token (required)
-// - password: Password for new user account (required for new users)
-// - passwordConfirm: Password confirmation (required for new users)
 //
 // RESPONSES:
-// - 200: Invitation accepted successfully (existing user joined)
-// - 201: Invitation accepted successfully (new user created)
-// - 400: Invalid request data
-// - 404: Invalid or expired invitation
-// - 410: Invitation has expired
+// - 200: Invitation accepted successfully.
+// - 400: Invalid request data (e.g., missing token).
+// - 401: User is not authenticated.
+// - 403: Invitation is for a different user.
+// - 404: Invalid or expired invitation.
+// - 410: Invitation has expired.
 //
 // PARAMETERS:
 //   - e: Request event
@@ -62,139 +64,53 @@ func registerInviteEndpoint(app *pocketbase.PocketBase, options Options) error {
 //   - nil on success (response sent)
 //   - error for PocketBase to handle
 func acceptInviteHandler(e *core.RequestEvent, app *pocketbase.PocketBase) error {
+	// CORRECTED: Access the authenticated user via the e.Auth field
+	authRecord := e.Auth
+
 	// Parse request body
 	data := struct {
-		Token           string `json:"token" form:"token"`
-		Password        string `json:"password" form:"password"`
-		PasswordConfirm string `json:"passwordConfirm" form:"passwordConfirm"`
+		Token string `json:"token" form:"token"`
 	}{}
-	
+
 	if err := e.BindBody(&data); err != nil {
 		return e.BadRequestError("Failed to read request data", err)
 	}
-	
+
 	if data.Token == "" {
 		return e.BadRequestError("Token is required", nil)
 	}
-	
+
 	// Find invite by token
-	invite, err := app.FindFirstRecordByFilter("invites", "token = {:token}", 
+	invite, err := app.FindFirstRecordByFilter("invites", "token = {:token}",
 		dbx.Params{"token": data.Token})
 	if err != nil {
 		return e.NotFoundError("Invalid or expired invitation", nil)
 	}
-	
+
 	// Check expiry
 	if time.Now().After(invite.GetDateTime("expires_at").Time()) {
-		// Delete expired invite
+		// Clean up the expired invite
 		app.Delete(invite)
 		return e.Error(http.StatusGone, "This invitation has expired", nil)
 	}
-	
-	// Check if user exists
-	email := invite.GetString("email")
-	existingUser, _ := app.FindFirstRecordByFilter("users", "email = {:email}",
-		dbx.Params{"email": email})
-	
-	if existingUser == nil {
-		// NEW USER PATH: Create account and add to organization
-		return handleNewUserInvite(e, app, invite, data.Password, data.PasswordConfirm)
-	} else {
-		// EXISTING USER PATH: Just add to organization
-		return handleExistingUserInvite(e, app, invite, existingUser)
-	}
-}
 
-// handleNewUserInvite creates a new user account and adds them to the organization.
-//
-// BEHAVIOR:
-// - Validates password requirements
-// - Creates verified user account
-// - Sets current_organization
-// - Creates membership record
-// - Deletes invite
-//
-// PARAMETERS:
-//   - e: Request event
-//   - app: PocketBase application instance
-//   - invite: Invite record
-//   - password: User's chosen password
-//   - passwordConfirm: Password confirmation
-//
-// RETURNS:
-//   - nil on success (201 response sent)
-//   - error for PocketBase to handle
-func handleNewUserInvite(e *core.RequestEvent, app *pocketbase.PocketBase, 
-	invite *core.Record, password, passwordConfirm string) error {
-	
-	if password == "" || password != passwordConfirm {
-		return e.BadRequestError("Valid password is required", nil)
+	// SECURITY CHECK: Ensure the authenticated user is the one being invited.
+	if authRecord.Email() != invite.GetString("email") {
+		return e.ForbiddenError("This invitation is for a different user.", nil)
 	}
-	
-	// Create user account
-	usersCollection, err := app.FindCollectionByNameOrId("users")
-	if err != nil {
-		return e.InternalServerError("Failed to find users collection", err)
-	}
-	
-	userRecord := core.NewRecord(usersCollection)
-	userRecord.Set("email", invite.GetString("email"))
-	userRecord.Set("password", password)
-	userRecord.Set("passwordConfirm", passwordConfirm)
-	userRecord.Set("verified", true)
-	userRecord.Set("current_organization", invite.GetString("organization"))
-	
-	if err := app.Save(userRecord); err != nil {
-		return e.BadRequestError("Failed to create account", err)
-	}
-	
-	// Create membership
-	if err := createMembership(app, userRecord.Id, 
-		invite.GetString("organization"), 
-		invite.GetString("role"),
-		invite.GetString("invited_by")); err != nil {
-		return e.InternalServerError("Account created but failed to add membership", err)
-	}
-	
-	// Delete invite
-	app.Delete(invite)
-	
-	return e.JSON(http.StatusCreated, map[string]interface{}{
-		"success": true,
-		"message": "Account created successfully",
-	})
-}
 
-// handleExistingUserInvite adds an existing user to the organization.
-//
-// BEHAVIOR:
-// - Checks if already a member
-// - Creates membership record
-// - Sets current_organization if not already set
-// - Deletes invite
-//
-// PARAMETERS:
-//   - e: Request event
-//   - app: PocketBase application instance
-//   - invite: Invite record
-//   - userRecord: Existing user record
-//
-// RETURNS:
-//   - nil on success (200 response sent)
-//   - error for PocketBase to handle
-func handleExistingUserInvite(e *core.RequestEvent, app *pocketbase.PocketBase,
-	invite *core.Record, userRecord *core.Record) error {
-	
-	// Check if already member
-	existing, _ := app.FindFirstRecordByFilter("memberships",
+	// Check if user is already a member of the target organization
+	orgID := invite.GetString("organization")
+	existingMembership, _ := app.FindFirstRecordByFilter("memberships",
 		"user = {:user} && organization = {:org}",
 		dbx.Params{
-			"user": userRecord.Id,
-			"org":  invite.GetString("organization"),
+			"user": authRecord.Id,
+			"org":  orgID,
 		})
-	
-	if existing != nil {
-		// Already a member - delete invite and return success
+
+	if existingMembership != nil {
+		// Already a member - the invitation is now redundant.
+		// Delete the invite and inform the user.
 		app.Delete(invite)
 		return e.JSON(http.StatusOK, map[string]interface{}{
 			"success":       true,
@@ -202,24 +118,30 @@ func handleExistingUserInvite(e *core.RequestEvent, app *pocketbase.PocketBase,
 			"message":       "You are already a member of this organization",
 		})
 	}
-	
-	// Create membership
-	if err := createMembership(app, userRecord.Id,
-		invite.GetString("organization"),
+
+	// Create the new membership record
+	if err := createMembership(app, authRecord.Id,
+		orgID,
 		invite.GetString("role"),
 		invite.GetString("invited_by")); err != nil {
 		return e.InternalServerError("Failed to add membership", err)
 	}
-	
-	// Set as current org if user doesn't have one
-	if userRecord.GetString("current_organization") == "" {
-		userRecord.Set("current_organization", invite.GetString("organization"))
-		app.Save(userRecord)
+
+	// Set as current organization if the user doesn't have one set
+	if authRecord.GetString("current_organization") == "" {
+		authRecord.Set("current_organization", orgID)
+		if err := app.Save(authRecord); err != nil {
+			// Log the error but don't fail the request, as the core action (joining) succeeded.
+			app.Logger().Error("Failed to set current_organization after invite accept", "error", err)
+		}
 	}
-	
-	// Delete invite
-	app.Delete(invite)
-	
+
+	// Delete the invite now that it has been successfully used
+	if err := app.Delete(invite); err != nil {
+		// Log the error but don't fail the request, as the user has already joined.
+		app.Logger().Error("Failed to delete invite after acceptance", "error", err)
+	}
+
 	return e.JSON(http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Successfully joined organization",
@@ -243,7 +165,7 @@ func createMembership(app *pocketbase.PocketBase, userID, orgID, role, invitedBy
 	if err != nil {
 		return err
 	}
-	
+
 	membership := core.NewRecord(collection)
 	membership.Set("user", userID)
 	membership.Set("organization", orgID)
@@ -251,6 +173,6 @@ func createMembership(app *pocketbase.PocketBase, userID, orgID, role, invitedBy
 	if invitedBy != "" {
 		membership.Set("invited_by", invitedBy)
 	}
-	
+
 	return app.Save(membership)
 }
