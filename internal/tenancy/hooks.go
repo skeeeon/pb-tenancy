@@ -36,8 +36,12 @@ func registerHooks(app *pocketbase.PocketBase, options Options) error {
 	})
 
 	// Hook 2: Invite created -> auto-set token and expiry
+	// FIXED: Added e.Next() to complete the request chain
 	app.OnRecordCreateRequest(options.InvitesCollection).BindFunc(func(e *core.RecordRequestEvent) error {
-		return autoSetInviteFields(app, e.Record, e, options)
+		if err := autoSetInviteFields(app, e.Record, e, options); err != nil {
+			return err
+		}
+		return e.Next() // Continue to next handler in the chain
 	})
 
 	// Hook 3: Invite created -> send email
@@ -107,9 +111,10 @@ func autoCreateOwnerMembership(app *pocketbase.PocketBase, orgRecord *core.Recor
 // autoSetInviteFields automatically sets token, expiry, and invited_by fields.
 //
 // BEHAVIOR:
-// - Generates secure random token
-// - Sets expiry date based on configuration
-// - Sets invited_by to current authenticated user
+// - Generates secure random token (only if not already set)
+// - Sets expiry date based on configuration (only if not already set)
+// - Sets invited_by to current authenticated user (only if not already set and auth available)
+// - This defensive approach allows superusers to manually override these fields
 //
 // PARAMETERS:
 //   - app: PocketBase application instance
@@ -121,21 +126,32 @@ func autoCreateOwnerMembership(app *pocketbase.PocketBase, orgRecord *core.Recor
 //   - nil on successful field setting
 //   - error if token generation fails
 func autoSetInviteFields(app *pocketbase.PocketBase, record *core.Record, e *core.RecordRequestEvent, options Options) error {
-	token, err := generateSecureToken()
-	if err != nil {
-		return err
+	// Only generate token if not already set (allows manual override)
+	if record.GetString("token") == "" {
+		token, err := generateSecureToken()
+		if err != nil {
+			return err
+		}
+		record.Set("token", token)
 	}
-	record.Set("token", token)
 
-	expiresAt := time.Now().AddDate(0, 0, options.InviteExpiryDays)
-	record.Set("expires_at", expiresAt)
+	// Only set expiry if not already set (allows manual override)
+	if record.GetDateTime("expires_at").IsZero() {
+		expiresAt := time.Now().AddDate(0, 0, options.InviteExpiryDays)
+		record.Set("expires_at", expiresAt)
+	}
 
-	if e.Request != nil {
-		info, err := e.RequestInfo()
-		if err == nil && info.Auth != nil {
-			record.Set("invited_by", info.Auth.Id)
+	// Only set invited_by if not already set AND auth user is available
+	// This allows superusers to manually set invited_by to impersonate another user
+	if record.GetString("invited_by") == "" {
+		if e.Request != nil {
+			info, err := e.RequestInfo()
+			if err == nil && info.Auth != nil {
+				record.Set("invited_by", info.Auth.Id)
+			}
 		}
 	}
+	
 	return nil
 }
 
@@ -206,8 +222,8 @@ func sendInviteEmail(app *pocketbase.PocketBase, inviteRecord *core.Record, opti
 	org := inviteRecord.ExpandedOne("organization")
 	inviter := inviteRecord.ExpandedOne("invited_by")
 	
-	if org == nil || inviter == nil {
-		return fmt.Errorf("failed to get expanded relations")
+	if org == nil {
+		return fmt.Errorf("failed to get expanded organization")
 	}
 	
 	// Parse template
@@ -227,9 +243,15 @@ func sendInviteEmail(app *pocketbase.PocketBase, inviteRecord *core.Record, opti
 		appURL = app.Settings().Meta.AppURL
 	}
 	
+	// Get inviter name, or use "Administrator" if invited_by is not set (superuser case)
+	inviterName := "Administrator"
+	if inviter != nil {
+		inviterName = getDisplayName(inviter)
+	}
+	
 	data := map[string]string{
 		"OrgName":     org.GetString("name"),
-		"InviterName": getDisplayName(inviter),
+		"InviterName": inviterName,
 		"Role":        inviteRecord.GetString("role"),
 		"InviteLink":  fmt.Sprintf("%s/accept-invite?token=%s", appURL, inviteRecord.GetString("token")),
 		"ExpiresAt":   inviteRecord.GetDateTime("expires_at").Time().Format("January 2, 2006"),
