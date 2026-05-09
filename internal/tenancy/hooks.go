@@ -214,9 +214,9 @@ const inviteEmailTemplate = `<!DOCTYPE html>
 //   - nil on successful email send
 //   - error if template execution or sending fails
 func sendInviteEmail(app *pocketbase.PocketBase, inviteRecord *core.Record, options Options) error {
-	// Expand relations
-	if err := app.ExpandRecord(inviteRecord, []string{"organization", "invited_by"}, nil); err != nil {
-		return fmt.Errorf("failed to expand invite relations: %w", err)
+	// Expand relations. v0.36+ returns a per-relation error map.
+	if errs := app.ExpandRecord(inviteRecord, []string{"organization", "invited_by"}, nil); len(errs) > 0 {
+		return fmt.Errorf("failed to expand invite relations: %v", errs)
 	}
 	
 	org := inviteRecord.ExpandedOne("organization")
