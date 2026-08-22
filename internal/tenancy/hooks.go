@@ -151,7 +151,7 @@ func autoSetInviteFields(app *pocketbase.PocketBase, record *core.Record, e *cor
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -218,37 +218,37 @@ func sendInviteEmail(app *pocketbase.PocketBase, inviteRecord *core.Record, opti
 	if errs := app.ExpandRecord(inviteRecord, []string{"organization", "invited_by"}, nil); len(errs) > 0 {
 		return fmt.Errorf("failed to expand invite relations: %v", errs)
 	}
-	
+
 	org := inviteRecord.ExpandedOne("organization")
 	inviter := inviteRecord.ExpandedOne("invited_by")
-	
+
 	if org == nil {
 		return fmt.Errorf("failed to get expanded organization")
 	}
-	
+
 	// Parse template
 	tmpl, err := template.New("invite").Parse(inviteEmailTemplate)
 	if err != nil {
 		return fmt.Errorf("failed to parse email template: %w", err)
 	}
-	
+
 	// Prepare email data
 	appName := options.AppName
 	if appName == "" {
 		appName = app.Settings().Meta.AppName
 	}
-	
+
 	appURL := options.AppURL
 	if appURL == "" {
 		appURL = app.Settings().Meta.AppURL
 	}
-	
+
 	// Get inviter name, or use "Administrator" if invited_by is not set (superuser case)
 	inviterName := "Administrator"
 	if inviter != nil {
 		inviterName = getDisplayName(inviter)
 	}
-	
+
 	data := map[string]string{
 		"OrgName":     org.GetString("name"),
 		"InviterName": inviterName,
@@ -256,13 +256,13 @@ func sendInviteEmail(app *pocketbase.PocketBase, inviteRecord *core.Record, opti
 		"InviteLink":  fmt.Sprintf("%s/accept-invite?token=%s", appURL, inviteRecord.GetString("token")),
 		"ExpiresAt":   inviteRecord.GetDateTime("expires_at").Time().Format("January 2, 2006"),
 	}
-	
+
 	// Execute template
 	var body strings.Builder
 	if err := tmpl.Execute(&body, data); err != nil {
 		return fmt.Errorf("failed to execute email template: %w", err)
 	}
-	
+
 	// Send using PocketBase mailer
 	message := &mailer.Message{
 		From: mail.Address{
@@ -273,7 +273,7 @@ func sendInviteEmail(app *pocketbase.PocketBase, inviteRecord *core.Record, opti
 		Subject: fmt.Sprintf("You've been invited to join %s", org.GetString("name")),
 		HTML:    body.String(),
 	}
-	
+
 	return app.NewMailClient().Send(message)
 }
 
